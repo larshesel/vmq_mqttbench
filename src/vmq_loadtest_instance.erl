@@ -18,6 +18,17 @@
          subst_rand/1,
          init/2]).
 
+-record(conn,
+        {
+          host,
+          port,
+          connect_opts,
+          client_id,
+          opts,
+          transport,
+          socket
+        }).
+
 start_link(Opts) ->
     proc_lib:start_link(?MODULE, init, [self(), Opts]).
 
@@ -26,10 +37,10 @@ init(Parent, Opts) ->
     ok = proc_lib:init_ack(Parent, {ok, self()}),
     try
         put(track_stats, proplists:get_value(track_stats, Opts, true)),
-        connect(Opts)
+        pre_connect(Opts)
     catch
         E:R ->
-            io:format("[~p] instance terminated due to ~p ~p~n", [self(), E, R])
+            io:format("[~p] instance terminated due to ~p ~p~n~p", [self(), E, R, erlang:get_stacktrace()])
     end,
     metrics({num_instances, {dec, 1}}).
 
@@ -53,11 +64,11 @@ connect_opts(Opts) ->
             [{ip, SrcIp}|ConnectOpts1]
     end.
 
-connect(Opts) ->
-    connect(proplists:get_bool(tls, Opts), Opts).
-connect(false, Opts) ->
+pre_connect(Opts) ->
+    pre_connect(proplists:get_bool(tls, Opts), Opts).
+pre_connect(false, Opts) ->
     connect(gen_tcp, connect_opts(Opts), Opts);
-connect(true, Opts) ->
+pre_connect(true, Opts) ->
     ConnectOpts = [{certfile, proplists:get_value(client_cert, Opts)},
                    {keyfile, proplists:get_value(client_key, Opts)},
                    {cacertfile, proplists:get_value(client_ca, Opts)}
@@ -67,9 +78,20 @@ connect(true, Opts) ->
 connect(Transport, ConnectOpts, Opts) ->
     Hosts = proplists:get_value(hosts, Opts),
     {Host, Port} = lists:nth(random:uniform(length(Hosts)), Hosts),
+
+    ClientId = gen_client_id(),
+    Opts1 = maybe_use_client_id_as_username(Opts, ClientId),
+
+    Conn = #conn{host = Host, port = Port, transport = Transport,
+                 connect_opts = ConnectOpts, opts = Opts1,
+                 client_id = ClientId},
+    connect(Conn).
+
+connect(#conn{host=Host, port=Port, transport=Transport,
+               connect_opts=ConnectOpts, opts=Opts}=S) ->
     case Transport:connect(Host, Port, ConnectOpts) of
         {ok, Socket} ->
-            setup(Transport, Socket, Opts);
+            mqtt_connect(S#conn{socket=Socket});
         {error, Reason} ->
             exit({cant_connect, Reason})
     end.
@@ -83,10 +105,9 @@ send(Transport, Socket, Data, What) ->
             exit({cant_send, What, Reason})
     end.
 
-setup(Transport, Socket, Opts) ->
-    ClientId = gen_client_id(),
-    Opts1 = maybe_use_client_id_as_username(Opts, ClientId),
-    Connect = vmq_parser:gen_connect(ClientId, Opts1),
+mqtt_connect(#conn{transport=Transport, socket=Socket,
+                   client_id=ClientId, opts=Opts} = C) ->
+    Connect = vmq_parser:gen_connect(ClientId, Opts),
     send(Transport, Socket, Connect, connect),
     {Proto, ProtoClosed, ProtoError} = proto(Transport),
     active_once(Transport, Socket),
@@ -95,11 +116,11 @@ setup(Transport, Socket, Opts) ->
             case vmq_parser:parse(Data) of
                 {#mqtt_connack{}, Rest} ->
                     metrics({num_instances, {inc, 1}}),
-                    Scenario = proplists:get_value(scenario, Opts1, []),
+                    Scenario = proplists:get_value(scenario, Opts, []),
                     EScenario = enrich_scenario(Scenario, ClientId),
                     SetupSteps = proplists:get_value(setup, EScenario, []),
-                    run_steps(Transport, Socket, SetupSteps),
-                    loop(Transport, Socket, Rest, EScenario);
+                    {ok, C1} = run_steps(C, SetupSteps),
+                    loop(C1, Rest, EScenario);
                 Other ->
                     exit({unexpected_msg_in_setup, Other})
             end;
@@ -109,16 +130,16 @@ setup(Transport, Socket, Opts) ->
             exit({socket_error_in_setup, Reason})
     end.
 
-run_steps(_Transport, _Socket, []) -> ok;
-run_steps(Transport, Socket, [{tick, Millis}|Steps]) ->
+run_steps(C, []) -> {ok, C};
+run_steps(#conn{} = C, [{tick, Millis}|Steps]) ->
     erlang:send_after(Millis, self(), tick),
-    run_steps(Transport, Socket, Steps);
-run_steps(Transport, Socket, [{subscribe, Topic, QoS}|Steps]) ->
+    run_steps(C, Steps);
+run_steps(#conn{transport=Transport, socket=Socket}=C, [{subscribe, Topic, QoS}|Steps]) ->
     Mid = gen_mid(),
     Subscribe = vmq_parser:gen_subscribe(Mid, Topic, QoS),
     send(Transport, Socket, Subscribe, subscribe),
-    run_steps(Transport, Socket, Steps);
-run_steps(Transport, Socket, [{publish, Topic, QoS, PayloadSize}|Steps]) ->
+    run_steps(C, Steps);
+run_steps(#conn{transport=Transport, socket=Socket}=C, [{publish, Topic, QoS, PayloadSize}|Steps]) ->
     Payload = term_to_binary([os:timestamp(), crypto:rand_bytes(PayloadSize)]),
     Publish = vmq_parser:gen_publish(Topic, QoS, Payload, [{mid, gen_mid()}]),
     send(Transport, Socket, Publish, publish),
@@ -127,9 +148,21 @@ run_steps(Transport, Socket, [{publish, Topic, QoS, PayloadSize}|Steps]) ->
             metrics({published_msgs, {inc, 1}});
         _ -> ignore
     end,
-    run_steps(Transport, Socket, Steps);
-run_steps(_, _, [Step|_]) ->
+    run_steps(C, Steps);
+run_steps(C, [reconnect|Steps]) ->
+    C1 = disconnect(C),
+    %% connect will automatically re-renter run-steps, theough the
+    %% remaining steps in this run will have been 'forgotten'.
+    connect(C1);
+run_steps(_, [Step|_]) ->
     exit({step_error, Step}).
+
+disconnect(#conn{transport=Transport,socket=Socket}=C) ->
+    Disconnect = vmq_parser:gen_disconnect(),
+    send(Transport, Socket, Disconnect, disconnect),
+    Transport:close(Socket),
+    metrics({num_instances, {dec, 1}}),
+    C#conn{socket=undefined}.
 
 enrich_scenario(Scenario, ClientId) ->
     SetupSteps = proplists:get_value(setup, Scenario, []),
@@ -185,21 +218,21 @@ maybe_use_client_id_as_username(Opts, ClientId) ->
          Opts
     end.
 
-loop(Transport, Socket, Buf, Scenario) ->
+loop(#conn{transport=Transport, socket=Socket}=C, Buf, Scenario) ->
     P = proto(Transport),
     active_once(Transport, Socket),
-    loop(Transport, Socket, Buf, proplists:get_value(steps, Scenario, []), P).
+    loop(C, Buf, proplists:get_value(steps, Scenario, []), P).
 
-loop(Transport, Socket, Buf, Steps, {Proto, ProtoClosed, ProtoError} = P) ->
+loop(#conn{transport=Transport, socket=Socket}=C, Buf, Steps, {Proto, ProtoClosed, ProtoError} = P) ->
     active_once(Transport, Socket),
     receive
         tick ->
-            run_steps(Transport, Socket, Steps),
-            loop(Transport, Socket, Buf, Steps, P);
+            {ok, C1} = run_steps(C, Steps),
+            loop(C1, Buf, Steps, P);
         {Proto, _, Data} ->
             metrics({bytes_in, {inc, byte_size(Data)}}),
             NewBuf = process_frame(Transport, Socket, <<Buf/binary, Data/binary>>),
-            loop(Transport, Socket, NewBuf, Steps, P);
+            loop(C, NewBuf, Steps, P);
         {ProtoError, _, Reason} ->
             exit({socket_error, Reason});
         {ProtoClosed, _} ->
